@@ -32,18 +32,11 @@ def attitude_pd(q, omega, q_desired, inertia, n, Kp, Kd):
     C = Rotation.from_quat(q).as_matrix()
     C_desired = Rotation.from_quat(q_desired).as_matrix()
 
-    attitude_error = Rotation.from_matrix(
-        C.T @ C_desired
-    ).as_rotvec()
+    attitude_error = Rotation.from_matrix(C.T @ C_desired).as_rotvec()
 
     omega_desired = C.T @ np.array([0.0, 0.0, n])
     rate_error = omega - omega_desired
 
     omega_desired_dot = -np.cross(omega, omega_desired)
 
-    return (
-        Kp @ attitude_error
-        - Kd @ rate_error
-        + np.cross(omega, inertia @ omega)
-        + inertia @ omega_desired_dot
-    )
+    return Kp @ attitude_error - Kd @ rate_error + np.cross(omega, inertia @ omega) + inertia @ omega_desired_dot

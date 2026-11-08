@@ -1,5 +1,6 @@
 import numpy as np
 
+# FOR BOTH THE KF AND EKF ADD NIS GATING FOR BAD MEASUREMENTS
 
 class KalmanFilter:
     def __init__(self, Ad, Bd, Cd, Q, R, P0=None):
@@ -13,11 +14,7 @@ class KalmanFilter:
         self.n = self.Fk.shape[0]
         self.m = self.Hk.shape[0]
 
-        self.P_post = (
-            0.1 * np.eye(self.n)
-            if P0 is None
-            else np.asarray(P0, dtype=float).copy()
-        )
+        self.P_post = (0.1 * np.eye(self.n) if P0 is None else np.asarray(P0, dtype=float).copy())
 
         self.P_pred = None
         self.x_pred = None
@@ -27,20 +24,14 @@ class KalmanFilter:
         u = np.asarray(u, dtype=float).reshape(self.Bk.shape[1], 1)
 
         self.x_pred = self.Fk @ x + self.Bk @ u
-        self.P_pred = (
-            self.Fk @ self.P_post @ self.Fk.T + self.Q
-        )
+        self.P_pred = (self.Fk @ self.P_post @ self.Fk.T + self.Q)
 
         return self.x_pred.copy()
 
     def update(self, measurement):
-        if self.x_pred is None:
-            raise RuntimeError("Call predict() before update()")
+        if self.x_pred is None: raise RuntimeError("Call predict() before update()")
 
-        measurement = np.asarray(
-            measurement, dtype=float
-        ).reshape(self.m, 1)
-
+        measurement = np.asarray(measurement, dtype=float).reshape(self.m, 1)
         residual = measurement - self.Hk @ self.x_pred
 
         S = self.Hk @ self.P_pred @ self.Hk.T + self.R
@@ -51,10 +42,7 @@ class KalmanFilter:
         x_update = self.x_pred + K @ residual
 
         I_KH = np.eye(self.n) - K @ self.Hk
-        self.P_post = (
-            I_KH @ self.P_pred @ I_KH.T
-            + K @ self.R @ K.T
-        )
+        self.P_post = (I_KH @ self.P_pred @ I_KH.T + K @ self.R @ K.T) # using jacob's form to make sure there isn't any instability
 
         self.P_post = 0.5 * (self.P_post + self.P_post.T)
 
