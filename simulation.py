@@ -1,4 +1,5 @@
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 import dynamics
 import utils
@@ -16,6 +17,7 @@ def simulate(n, initial_state, dt, T):
     # u = np.zeros((3, 1))
 
     mass = 150.0
+    inertia = np.diag([20.0, 25.0, 15.0]) # TODO: (Placeholder) Verify this inertia with the MANGO publically released data
     thrusters = actuation.translation_thrusters(max_thrust=1.0)
 
     total_steps = int(T / dt)
@@ -74,7 +76,7 @@ def simulate(n, initial_state, dt, T):
 
         u = (resultant_thrust.force_body / mass).reshape(3, 1)
 
-        state = utils.rk4(A, B, state, u, dt)
+        state = utils.rk4(dynamics.cw_derivative, state, dt, A, B, u)
 
         # Do state estimation:
 

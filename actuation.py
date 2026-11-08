@@ -12,6 +12,12 @@ class ActuationResult:
     torque_body: np.ndarray       
     residual: np.ndarray
 
+@dataclass(frozen=True)
+class ReactionWheelResult:
+    torque_body: np.ndarray
+    momentum_next: np.ndarray
+    residual: np.ndarray
+
 class ThrusterArray:
     def __init__(self, positions, directions, max_thrust):
        
@@ -104,3 +110,54 @@ def educational_attitude_thrusters(arm=0.4, max_thrust=1.0):
             positions.extend((r, -r))
             directions.extend((sign*d, -sign*d))
     return ThrusterArray(positions, directions, max_thrust)
+
+
+class ReactionWheels:
+
+    def __init__(self, max_torque, max_momentum):
+        self.max_torque = np.broadcast_to(
+            max_torque, (3,)
+        ).astype(float).copy()
+
+        self.max_momentum = np.broadcast_to(
+            max_momentum, (3,)
+        ).astype(float).copy()
+
+        for value in (self.max_torque, self.max_momentum):
+            if not np.all(np.isfinite(value)) or np.any(value <= 0):
+                raise ValueError("Wheel limits must be finite and positive")
+
+    def allocate(self, requested_torque, momentum, dt):
+
+        if not np.isfinite(dt) or dt <= 0:
+            raise ValueError("dt must be finite and positive")
+
+        requested = np.asarray(
+            requested_torque, dtype=float
+        ).reshape(3)
+
+        h = np.asarray(momentum, dtype=float).reshape(3)
+
+        if not np.all(np.isfinite(requested)) or not np.all(np.isfinite(h)):
+            raise ValueError("Torque and momentum must be finite")
+
+        if np.any(np.abs(h) > self.max_momentum):
+            raise ValueError("Initial wheel momentum exceeds capacity")
+
+        lower = np.maximum(
+            -self.max_torque,
+            (h - self.max_momentum) / dt,
+        )
+        upper = np.minimum(
+            self.max_torque,
+            (h + self.max_momentum) / dt,
+        )
+
+        actual = np.clip(requested, lower, upper)
+        h_next = h - actual * dt
+
+        return ReactionWheelResult(
+            torque_body=actual,
+            momentum_next=h_next,
+            residual=requested - actual,
+        )
