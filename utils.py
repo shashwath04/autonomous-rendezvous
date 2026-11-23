@@ -1,10 +1,11 @@
 import numpy as np
 from scipy.spatial.transform import Rotation
-from dynamics import cw_derivative
 
 
 def forward_euler(A, B, state, control, dt):
-    state_dot = cw_derivative(A, B, state, control)
+    from dynamics import cw_derivative
+
+    state_dot = cw_derivative(state, A, B, control)
     next_state = state + state_dot * dt
     return next_state
 

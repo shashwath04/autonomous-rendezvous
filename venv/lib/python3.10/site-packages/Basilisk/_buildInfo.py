@@ -1,0 +1,272 @@
+#
+# ISC License
+#
+# Copyright (c) 2026, Autonomous Vehicle Systems Lab, University of Colorado at Boulder
+#
+# Permission to use, copy, modify, and/or distribute this software for any
+# purpose with or without fee is hereby granted, provided that the above
+# copyright notice and this permission notice appear in all copies.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+# WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+# MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+# ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+# WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+# ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+# OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+#
+
+from copy import deepcopy as _deepcopy
+from importlib import invalidate_caches as _invalidateImportCaches
+from importlib.metadata import distributions as _distributions
+
+from Basilisk._buildAbiData import buildAbiData as _buildAbiData
+from Basilisk._buildInfoData import buildInfoData as _buildInfoData
+
+_buildInfoData = {**_buildInfoData, "abi": _buildAbiData}
+_buildFeatureEntryPointGroup = "basilisk.build_features"
+
+
+def _installedBuildFeatureProviders() -> dict[str, tuple[tuple[str, str], ...]]:
+    """Return optional feature providers discovered from distribution metadata."""
+    _invalidateImportCaches()
+    providers: dict[str, set[tuple[str, str]]] = {}
+    for distribution in _distributions():
+        distributionName = distribution.metadata.get("Name") or "<unknown>"
+        distributionVersion = distribution.version or "<unknown>"
+        for entryPoint in distribution.entry_points:
+            if entryPoint.group == _buildFeatureEntryPointGroup:
+                providers.setdefault(entryPoint.name, set()).add(
+                    (distributionName, distributionVersion)
+                )
+
+    return {
+        featureName: tuple(sorted(featureProviders))
+        for featureName, featureProviders in providers.items()
+    }
+
+
+def getBuildInfo() -> dict[str, object]:
+    """Return metadata describing the Basilisk binary and its build.
+
+    Values under ``features`` identify configured optional build capabilities.
+    Values under ``abi`` are captured by compiled C and C++ probes. Values under
+    ``diagnostics`` describe CMake observations, build tools, and the requested
+    Conan profile.
+
+    :return: A copy of the build metadata.
+    :rtype: dict[str, object]
+    """
+    return _deepcopy(_buildInfoData)
+
+
+def hasBuildFeature(featureName: str) -> bool:
+    """Return whether the installed Basilisk distributions provide a build feature.
+
+    :param featureName: Name from the ``features`` section of :func:`getBuildInfo`.
+    :return: ``True`` when the core build or an installed optional Basilisk
+        distribution provides the feature.
+    :raises KeyError: If ``featureName`` is not a known build feature.
+    :raises RuntimeError: If an optional feature provider is incompatible with
+        the installed Basilisk core version.
+    """
+    features = _buildInfoData["features"]
+    try:
+        configured = features[featureName]
+    except KeyError:
+        availableFeatures = ", ".join(sorted(features))
+        raise KeyError(
+            f"Unknown Basilisk build feature '{featureName}'. "
+            f"Available features: {availableFeatures}"
+        ) from None
+
+    providers = _installedBuildFeatureProviders().get(featureName, ())
+    coreVersion = _buildInfoData["artifact"]["basiliskVersion"]
+    incompatibleProviders = sorted(
+        (distributionName, version)
+        for distributionName, version in providers
+        if version != coreVersion
+    )
+    if incompatibleProviders:
+        details = ", ".join(
+            f"{distributionName}=={version}"
+            for distributionName, version in incompatibleProviders
+        )
+        raise RuntimeError(
+            f"Basilisk build feature '{featureName}' is provided by an incompatible "
+            f"optional distribution ({details}); install a provider matching "
+            f"bsk=={coreVersion}."
+        )
+
+    return configured or bool(providers)
+
+
+def _appendField(lines: list[str], label: str, value: str) -> None:
+    if value:
+        lines.append(f"  {label + ':':<16}{value}")
+
+
+def _compilerDescription(compilerInfo: dict[str, str]) -> str:
+    description = " ".join(
+        value for value in (compilerInfo["id"], compilerInfo["version"]) if value
+    )
+    details = []
+    if compilerInfo["executable"]:
+        details.append(compilerInfo["executable"])
+    if compilerInfo["launcher"]:
+        details.append(f"launcher: {compilerInfo['launcher']}")
+    if details:
+        description += f" ({'; '.join(details)})"
+    return description
+
+
+def _languageStandard(prefix: str, standard: str) -> str:
+    if standard.isdigit():
+        return f"{prefix}{standard}"
+    return standard
+
+
+def _compiledLanguageStandard(prefix: str, standard: int) -> str:
+    standards = {
+        "C": {199409: "C95", 199901: "C99", 201112: "C11", 201710: "C17", 202311: "C23"},
+        "C++": {199711: "C++98", 201103: "C++11", 201402: "C++14", 201703: "C++17", 202002: "C++20"},
+    }
+    return standards.get(prefix, {}).get(standard, f"{prefix} ({standard})" if standard else "")
+
+
+def _cxxAbiDescription(abi: dict[str, object]) -> str:
+    cxx = abi["cxx"]
+    standardLibrary = cxx["standardLibrary"]
+    details = []
+    if standardLibrary["version"]:
+        details.append(str(standardLibrary["version"]))
+    if standardLibrary["abiVersion"]:
+        details.append(f"ABI {standardLibrary['abiVersion']}")
+    if standardLibrary["useCxx11Abi"] is not None:
+        details.append(f"C++11 ABI {standardLibrary['useCxx11Abi']}")
+    description = {"msvc": "MSVC STL"}.get(
+        standardLibrary["family"], standardLibrary["family"]
+    )
+    if details:
+        description += f" ({', '.join(details)})"
+    abiFamily = {"itanium": "Itanium", "msvc": "MSVC"}.get(
+        cxx["compiler"]["abiFamily"], cxx["compiler"]["abiFamily"]
+    )
+    return f"{description}, {abiFamily} ABI"
+
+
+def _runtimeDescription(abi: dict[str, object]) -> str:
+    runtime = abi["cxx"]["runtime"]
+    details = [runtime["linkage"]]
+    if abi["cxx"]["compiler"]["abiFamily"] == "msvc":
+        details.append("debug" if runtime["debug"] else "release")
+    if runtime["exceptions"]:
+        details.append("exceptions")
+    if runtime["rtti"]:
+        details.append("RTTI")
+    return ", ".join(value for value in details if value)
+
+
+def _formatBuildInfo(buildInfo: dict[str, object]) -> str:
+    artifact = buildInfo["artifact"]
+    diagnostics = buildInfo["diagnostics"]
+    abi = buildInfo["abi"]
+    targetInfo = diagnostics["target"]
+    compiledTarget = abi["target"]
+    build = diagnostics["build"]
+    cCompiler = diagnostics["compilers"]["c"]
+    cxxCompiler = diagnostics["compilers"]["cxx"]
+    rustCompiler = diagnostics["compilers"]["rust"]
+    conanSettings = diagnostics["conanSettings"]
+
+    system = {"Darwin": "macOS"}.get(compiledTarget["system"], compiledTarget["system"])
+    architectures = compiledTarget["architecture"]
+    architectures = architectures.replace(";", ", ")
+    target = " ".join(value for value in (system, architectures) if value)
+    if compiledTarget["pointerSizeBytes"]:
+        target += f", {compiledTarget['pointerSizeBytes'] * 8}-bit"
+
+    configuration = abi["build"]["configuration"]
+    if not configuration:
+        configuration = "Multi-config" if build["multiConfig"] else build["configuration"]
+    generator = build["generator"]
+    generatorDetails = [
+        value for value in (build["generatorPlatform"], build["generatorToolset"]) if value
+    ]
+    if generatorDetails:
+        generator += f" ({', '.join(generatorDetails)})"
+    buildDescription = ", ".join(value for value in (configuration, generator) if value)
+
+    lines = ["Basilisk Build Information"]
+    _appendField(
+        lines,
+        "Version",
+        f"{artifact['basiliskVersion']} (extension ABI {artifact['extensionAbiVersion']})",
+    )
+    _appendField(lines, "Target", target)
+    _appendField(lines, "Build", buildDescription)
+    featureDescription = ", ".join(
+        f"{featureName}={'on' if enabled else 'off'}"
+        for featureName, enabled in buildInfo["features"].items()
+    )
+    _appendField(lines, "Features", featureDescription)
+    _appendField(lines, "C compiler", _compilerDescription(cCompiler))
+    _appendField(lines, "C++ compiler", _compilerDescription(cxxCompiler))
+    if buildInfo["features"]["rustModules"]:
+        _appendField(lines, "Rust compiler", _compilerDescription(rustCompiler))
+        _appendField(lines, "Rust target", rustCompiler["target"])
+    _appendField(lines, "C standard", _compiledLanguageStandard("C", abi["c"]["compiler"]["languageStandard"]))
+    _appendField(lines, "C++ standard", _compiledLanguageStandard("C++", abi["cxx"]["compiler"]["languageStandard"]))
+    _appendField(lines, "C++ ABI", _cxxAbiDescription(abi))
+    _appendField(lines, "C++ runtime", _runtimeDescription(abi))
+    _appendField(lines, "Python API", build["pythonLimitedApi"])
+    _appendField(lines, "macOS target", targetInfo["osxDeploymentTarget"])
+
+    eigen = abi["dependencies"]["eigen"]
+    eigenDescription = f"{eigen['version']}, {eigen['maxAlignBytes']}-byte max alignment"
+    if eigen["vectorization"] != "none":
+        eigenDescription += f", {eigen['vectorization']}"
+    _appendField(lines, "Eigen", eigenDescription)
+    _appendField(lines, "SWIG runtime", abi["dependencies"]["swig"]["runtimeVersion"])
+
+    conanProfile = []
+    if conanSettings["buildType"]:
+        conanProfile.append(conanSettings["buildType"])
+    if conanSettings["cxxStandard"]:
+        conanProfile.append(_languageStandard("C++", conanSettings["cxxStandard"]))
+    if conanSettings["cxxStandardLibrary"]:
+        conanProfile.append(conanSettings["cxxStandardLibrary"])
+    runtime = conanSettings["compilerRuntime"]
+    if runtime and conanSettings["compilerRuntimeType"]:
+        runtime += f" ({conanSettings['compilerRuntimeType']})"
+    if runtime:
+        conanProfile.append(runtime)
+    _appendField(lines, "Conan profile", ", ".join(conanProfile))
+
+    toolLines = []
+    for label, key in (
+        ("CMake", "cmake"),
+        ("Conan", "conan"),
+        ("SWIG", "swig"),
+        ("Python", "python"),
+        ("Cargo", "cargo"),
+        ("Corrosion", "corrosion"),
+    ):
+        _appendField(toolLines, label, diagnostics["tools"][key])
+    if toolLines:
+        lines.extend(("", "Build Tools", *toolLines))
+
+    return "\n".join(lines)
+
+
+def printBuildInfo() -> None:
+    """Print a concise summary of the Basilisk binary and its build.
+
+    Empty fields that do not apply to the current platform are omitted.
+
+    :return: None.
+    """
+    print(_formatBuildInfo(_buildInfoData))
+
+
+__all__ = ["getBuildInfo", "hasBuildFeature", "printBuildInfo"]
