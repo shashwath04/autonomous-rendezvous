@@ -1,40 +1,24 @@
 import numpy as np
 
-from Basilisk.simulation import spacecraft, dragDynamicEffector, exponentialAtmosphere, reactionWheelStateEffector
-from Basilisk.utilities import SimulationBaseClass, macros, simIncludeGravBody, simIncludeRW
+from Basilisk.simulation import spacecraft, dragDynamicEffector, exponentialAtmosphere, reactionWheelStateEffector, thrusterDynamicEffector
+from Basilisk.utilities import SimulationBaseClass, macros, simIncludeGravBody, simIncludeRW, simIncludeThruster
 from Basilisk.utilities.supportDataTools.dataFetcher import DataFile, get_path
-from Basilisk.architecture import messaging, sysModel
+from Basilisk.architecture import messaging
 
-class WheelPointingController(sysModel.SysModel):
-    def __init__(self, state_msg, max_motor_torque, *, torque_test=False):
-        super().__init__()
-        self.ModelTag = "ChaserWheelPointing"
-        self.state_msg = state_msg
-        self.max_motor_torque = max_motor_torque
-        self.torque_test = torque_test
-        self.motor_cmd = messaging.ArrayMotorTorqueMsg()
-
-    def UpdateState(self, current_time_ns):
-        if self.torque_test:
-            motor_torque = np.full(3, 0.01)
-        else:
-            state = self.state_msg.read()
-            sigma = np.asarray(state.sigma_BN).reshape(3)
-            omega = np.asarray(state.omega_BN_B).reshape(3)
-
-            body_torque = -0.8 * sigma - 4.0 * omega
-            motor_torque = -body_torque
-
-        motor_torque = np.clip(motor_torque, -self.max_motor_torque, self.max_motor_torque)
-
-        payload = messaging.ArrayMotorTorqueMsgPayload()
-        commands = list(payload.motorTorque)
-        commands[:3] = motor_torque.tolist()
-        payload.motorTorque = commands
-        self.motor_cmd.write(payload, current_time_ns, self.moduleID)
+from actuation import WheelPointingController, ThrusterArray, translation_thrusters, educational_attitude_thrusters
 
 
-def run_orbit(*, radius_m_chief=6_777_000.0, radius_m_chaser=6_777_010.0, dt_s = 0.1, duration_s = 60.0, wheel_torque_test=False):
+def run_orbit(
+    *,
+    radius_m_chief=6_777_000.0,
+    radius_m_chaser=6_777_010.0,
+    dt_s=0.1,
+    duration_s=60.0,
+    wheel_torque_test=False,
+    rcs_wrench_body=None,
+    rcs_pulse_window_s=1.0,
+):
+    """Run the orbit, optionally firing one allocated body-frame RCS pulse."""
     sim = SimulationBaseClass.SimBaseClass()
     process = sim.CreateNewProcess('dynamics')
     task_name = 'propagate'
@@ -112,6 +96,30 @@ def run_orbit(*, radius_m_chief=6_777_000.0, radius_m_chaser=6_777_010.0, dt_s =
     wheel_recorder = wheel_array.rwSpeedOutMsg.recorder()
     motor_recorder = controller.motor_cmd.recorder()
 
+    # I need to add the thrust allocation stuff
+
+    translation = translation_thrusters(max_thrust = 0.2)
+    attitude = educational_attitude_thrusters(arm = 0.4, max_thrust=0.2)
+
+    rcs_geometry = ThrusterArray(
+        positions = np.vstack((translation.positions, attitude.positions)),
+        directions = np.vstack((translation.directions, attitude.directions)),
+        max_thrust=np.concatenate((translation.max_thrust, attitude.max_thrust))
+    )
+
+    rcs = thrusterDynamicEffector.ThrusterDynamicEffector()
+    thruster_factory = simIncludeThruster.thrusterFactory()
+
+    for position, direction, max_thrust in zip(rcs_geometry.positions, rcs_geometry.directions, rcs_geometry.max_thrust):
+        thruster_factory.create(
+            "Blank_Thruster",
+            position.tolist(),
+            direction.tolist(),
+            MaxThrust = float(max_thrust),
+            steadyIsp = 60.0,
+        )
+
+    thruster_factory.addToSpacecraft("ChaserRCS", rcs, chaser)
 
     atmosphere.addSpacecraftToModel(chief.scStateOutMsg)
     atmosphere.addSpacecraftToModel(chaser.scStateOutMsg)
@@ -143,12 +151,39 @@ def run_orbit(*, radius_m_chief=6_777_000.0, radius_m_chaser=6_777_010.0, dt_s =
     sim.AddModelToTask(task_name, wheel_array, ModelPriority=20)
     sim.AddModelToTask(task_name, wheel_recorder, ModelPriority=0)
     sim.AddModelToTask(task_name, motor_recorder, ModelPriority=0)
+    sim.AddModelToTask(task_name, rcs, ModelPriority=20)
+
+    rcs_cmd = messaging.THRArrayOnTimeCmdMsg()
+    rcs.cmdsInMsg.subscribeTo(rcs_cmd)
+
+    rcs_recorders = [msg.recorder() for msg in rcs.thrusterOutMsgs]
+    for recorder in rcs_recorders:
+        sim.AddModelToTask(task_name, recorder, ModelPriority=0)
 
     sim.InitializeSimulation()
+
+    payload = messaging.THRArrayOnTimeCmdMsgPayload()
+    on_times = list(payload.OnTimeRequest)
+
+    if rcs_wrench_body is not None:
+        wrench = np.asarray(rcs_wrench_body, dtype=float).reshape(6)
+        allocation = rcs_geometry.allocate(
+            force_body=wrench[:3],
+            torque_body=wrench[3:],
+        )
+
+        num_jets = len(rcs_geometry.max_thrust)
+        on_times[:num_jets] = (
+            allocation.duty_cycle * rcs_pulse_window_s
+        ).tolist()
+
+    payload.OnTimeRequest = on_times
+    rcs_cmd.write(payload)
+    
     sim.ConfigureStopTime(macros.sec2nano(duration_s))
     sim.ExecuteSimulation()
 
-    return {
+    result = {
         "time_s_chief": chief_recorder.times() * macros.NANO2SEC,
         "position_m_chief": np.asarray(chief_recorder.r_BN_N),
         "velocity_mps_chief": np.asarray(chief_recorder.v_BN_N),
@@ -159,6 +194,9 @@ def run_orbit(*, radius_m_chief=6_777_000.0, radius_m_chaser=6_777_010.0, dt_s =
         "omega_BN_B_chaser": np.asarray(chaser_recorder.omega_BN_B),
         "wheel_speed_rad_s": np.asarray(wheel_recorder.wheelSpeeds)[:, :3],
         "wheel_motor_torque_nm": np.asarray(motor_recorder.motorTorque)[:, :3],
+        "rcs_force_body_n": np.sum([rec.thrustForce_B for rec in rcs_recorders], axis=0),
+        "rcs_torque_body_nm": np.sum([rec.thrustTorquePntB_B for rec in rcs_recorders], axis=0),
     }
+    return result
 
 

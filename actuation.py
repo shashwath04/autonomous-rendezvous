@@ -3,6 +3,10 @@ from dataclasses import dataclass
 import numpy as np
 from scipy.optimize import lsq_linear
 
+from Basilisk.architecture import messaging, sysModel
+from Basilisk.simulation import thrusterDynamicEffector
+from Basilisk.utilities import simIncludeThruster
+
 @dataclass(frozen=True)
 class ActuationResult:
     thrust: np.ndarray            
@@ -111,6 +115,49 @@ def educational_attitude_thrusters(arm=0.4, max_thrust=1.0):
     return ThrusterArray(positions, directions, max_thrust)
 
 
+def chaser_rcs(max_thrust=0.2, arm=0.4):
+    """Build the Chaser's idealized body-frame RCS geometry."""
+    translation = translation_thrusters(max_thrust)
+    attitude = educational_attitude_thrusters(arm, max_thrust)
+    return ThrusterArray(
+        np.vstack((translation.positions, attitude.positions)),
+        np.vstack((translation.directions, attitude.directions)),
+        np.concatenate((translation.max_thrust, attitude.max_thrust)),
+    )
+
+
+def attach_basilisk_rcs(vehicle, array, allocation, pulse_window_s):
+    """Attach the cluster and prepare one pulse command for an allocated wrench."""
+    if not np.isfinite(pulse_window_s) or pulse_window_s <= 0:
+        raise ValueError("RCS pulse window must be finite and positive")
+
+    payload = messaging.THRArrayOnTimeCmdMsgPayload()
+    on_times = list(payload.OnTimeRequest)
+    count = len(array.max_thrust)
+    if count > len(on_times):
+        raise ValueError("Thruster array exceeds Basilisk's command capacity")
+    on_times[:count] = (allocation.duty_cycle * pulse_window_s).tolist()
+    payload.OnTimeRequest = on_times
+
+    effector = thrusterDynamicEffector.ThrusterDynamicEffector()
+    factory = simIncludeThruster.thrusterFactory()
+    for position, direction, limit in zip(
+        array.positions, array.directions, array.max_thrust
+    ):
+        factory.create(
+            "Blank_Thruster",
+            position.tolist(),
+            direction.tolist(),
+            MaxThrust=float(limit),
+            steadyIsp=60.0,  # s, illustrative cold-gas value
+        )
+    factory.addToSpacecraft("ChaserRCS", effector, vehicle)
+
+    command = messaging.THRArrayOnTimeCmdMsg()
+    effector.cmdsInMsg.subscribeTo(command)
+    return effector, command, payload
+
+
 class ReactionWheels:
 
     def __init__(self, max_torque, max_momentum):
@@ -160,3 +207,33 @@ class ReactionWheels:
             momentum_next=h_next,
             residual=requested - actual,
         )
+
+
+
+class WheelPointingController(sysModel.SysModel):
+    def __init__(self, state_msg, max_motor_torque, *, torque_test=False):
+        super().__init__()
+        self.ModelTag = "ChaserWheelPointing"
+        self.state_msg = state_msg
+        self.max_motor_torque = max_motor_torque
+        self.torque_test = torque_test
+        self.motor_cmd = messaging.ArrayMotorTorqueMsg()
+
+    def UpdateState(self, current_time_ns):
+        if self.torque_test:
+            motor_torque = np.full(3, 0.01)
+        else:
+            state = self.state_msg.read()
+            sigma = np.asarray(state.sigma_BN).reshape(3)
+            omega = np.asarray(state.omega_BN_B).reshape(3)
+
+            body_torque = -0.8 * sigma - 4.0 * omega
+            motor_torque = -body_torque
+
+        motor_torque = np.clip(motor_torque, -self.max_motor_torque, self.max_motor_torque)
+
+        payload = messaging.ArrayMotorTorqueMsgPayload()
+        commands = list(payload.motorTorque)
+        commands[:3] = motor_torque.tolist()
+        payload.motorTorque = commands
+        self.motor_cmd.write(payload, current_time_ns, self.moduleID)
